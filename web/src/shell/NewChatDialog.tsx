@@ -4060,6 +4060,7 @@ function NewChatLandingContent({
       return [{ label: "Permission mode", value: devinValue }, ...routingRow];
     }
     if (selectedAcpHarness !== null) {
+      if (acpModelOptions.length === 0) return [];
       const pickedAcpRow = acpModelOptions.find((option) => option.id === pickedModel);
       const modelValue = pickedAcpRow
         ? nativeModelLabel(pickedAcpRow)
@@ -4425,7 +4426,8 @@ function NewChatLandingContent({
     supportsPermissionMode ||
     supportsDevinMode ||
     selectedNativeHarness === "codex-native" ||
-    selectedAcpHarness !== null
+    (selectedAcpHarness !== null &&
+      (acpModelOptions.length > 0 || hostAcpModelsLoading || hostAcpModelsError != null))
       ? {
           testId: "new-chat-landing-agent-models",
           header: "Models",
