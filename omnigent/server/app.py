@@ -5068,7 +5068,11 @@ def create_app(
                         else:
                             prefetch_session_routing_catalogs(conv.id, conv, routed.client)
                             prefetch_session_acp_model_options(
-                                conv.id, conv, routed.client, agent_store=agent_store
+                                conv.id,
+                                conv,
+                                routed.client,
+                                agent_store=agent_store,
+                                store_slots=store_slots,
                             )
                         # A crash can leave a persisted count absent from the live index.
                         session_live_state.persist_pending_count(
@@ -5203,7 +5207,11 @@ def create_app(
                         response.raise_for_status()
                     prefetch_session_routing_catalogs(conv.id, conv, client)
                     prefetch_session_acp_model_options(
-                        conv.id, conv, client, agent_store=agent_store
+                        conv.id,
+                        conv,
+                        client,
+                        agent_store=agent_store,
+                        store_slots=store_slots,
                     )
                     # Clear only a root's disconnect failure, after successful init.
                     # Children retain interruption evidence until continuation runs.
