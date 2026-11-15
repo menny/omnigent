@@ -172,6 +172,7 @@ import {
   parseMentionToken,
   rankMentionEntries,
   recallFileMentions,
+  resolveMentionHarness,
 } from "@/lib/composerMentions";
 import { useChildSessions } from "@/hooks/useChildSessions";
 import {
@@ -3002,8 +3003,16 @@ function ComposerImpl(
   // menu, so the workspace listing is never fetched for them. Codex's marker
   // says "Attached file:" while the others say "Attached:" - see
   // ``mentionMarkerFor``. FileViewer's "Attach to agent" gate uses the same helper.
+  const sessionHostId = useChatStore((s) => s.sessionHostId) ?? composerSession?.hostId ?? null;
+  const { data: composerHostRows } = useHosts({ enabled: !!sessionHostId, includeSandbox: true });
+  const composerHost = composerHostRows?.find((row) => row.host_id === sessionHostId) ?? null;
   const fileMentionHarnesses = useFileMentionHarnesses();
-  const mentionEnabled = harnessSupportsFileMentions(sessionHarness, fileMentionHarnesses);
+  const mentionHarness = resolveMentionHarness(sessionHarness, sessionAgent?.harness);
+  const mentionEnabled = harnessSupportsFileMentions(
+    mentionHarness,
+    fileMentionHarnesses,
+    composerHost?.workspace_file_mentions,
+  );
   const workspaceFilesQuery = useWorkspaceAllFiles(composerSessionId ?? undefined, {
     enabled: mentionEnabled,
   });
@@ -3454,7 +3463,7 @@ function ComposerImpl(
   // Depends on mentionedItems (from the hook above), so it's computed here.
   // Tagged items whose token is still in the draft; deleting a token untags it.
   const liveMentions = presentMentions(
-    composerInlineMentions(mentionedItems, mentionedSessions, sessionHarness),
+    composerInlineMentions(mentionedItems, mentionedSessions, mentionHarness),
     [draft.text, ...draft.quotes.map((quote) => quote.before)],
   );
   const hasMentions = liveMentions.length > 0;

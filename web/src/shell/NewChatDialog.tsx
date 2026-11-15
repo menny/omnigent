@@ -281,6 +281,7 @@ import {
   isAutoHarness,
   SMART_ROUTING_LABEL,
   useBrainHarnessLabels,
+  useFileMentionHarnesses,
 } from "@/lib/agentLabels";
 import {
   SMART_ROUTING_ARMS,
@@ -407,6 +408,7 @@ import {
   composerInlineMentions,
   expandMentionTokens,
   findMentionTokens,
+  harnessSupportsFileMentions,
   presentMentions,
   type TaggedMentions,
   withSessionMentionHint,
@@ -5610,8 +5612,17 @@ function NewChatLandingContent({
   // workspace API; each tagged path is delivered as an "[Attached: …]" marker
   // prepended to the first message, which the runner reads from that workspace.
   const [mention, setMention] = useState<MentionState | null>(null);
+  const fileMentionHarnesses = useFileMentionHarnesses();
   const mentionEnabled =
-    isNativeTerminalAgent && !sandboxSelected && !!selectedHostId && workspaceValid;
+    (isNativeTerminalAgent ||
+      harnessSupportsFileMentions(
+        effectiveAgentHarness,
+        fileMentionHarnesses,
+        selectedHost?.workspace_file_mentions,
+      )) &&
+    !sandboxSelected &&
+    !!selectedHostId &&
+    workspaceValid;
   const { dir: mentionDir, filter: mentionFilter } = parseMentionToken(mention?.query ?? "");
   const workspaceRoot = workspaceTrimmed.replace(/\/+$/, "");
   // Absolute dir to list = workspace root + the drilled sub-path.
@@ -6457,7 +6468,7 @@ function NewChatLandingContent({
       // Computed BEFORE the create so `smart_routing_message` classifies the
       // prompt the agent actually receives, not the raw textarea value.
       const liveMentions = presentMentions(
-        composerInlineMentions(mentionedItems, mentionedSessions, selectedAgent?.harness ?? null),
+        composerInlineMentions(mentionedItems, mentionedSessions, effectiveAgentHarness),
         [message],
       );
       const initialPrompt = withSessionMentionHint(
