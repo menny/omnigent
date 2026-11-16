@@ -26,6 +26,7 @@ from fastapi import Response
 from omnigent.debug_logging import phase_scope
 from omnigent.errors import ElicitationDeclinedError, ErrorPhase
 from omnigent.harnesses.codex_native.shell_input import native_shell_authorization
+from omnigent.inner._tool_output import stringify_tool_payload as _stringify_tool_payload
 from omnigent.inner.executor import (
     CompactionComplete,
     CompactionStarted,
@@ -45,6 +46,8 @@ from omnigent.inner.executor import (
     TextChunk,
     ToolCallComplete,
     ToolCallRequest,
+    ToolCallUpdate,
+    ToolOutputDelta,
     TurnCancelled,
     TurnComplete,
 )
@@ -70,6 +73,7 @@ from omnigent.server.schemas import (
     ReasoningStartedEvent,
     ReasoningSummaryTextDeltaEvent,
     ReasoningTextDeltaEvent,
+    ToolOutputDeltaEvent,
 )
 
 _logger = logging.getLogger(__name__)
@@ -246,6 +250,7 @@ class ExecutorAdapter(HarnessApp):
         # reload. Dispatched calls never reach this — their ToolCallComplete
         # short-circuits — so it is observed-only.
         self._observed_tool_calls: dict[str, tuple[str, str]] = {}
+        self._observed_tool_item_ids: dict[str, str] = {}
         self._pr_tool_calls: dict[str, tuple[str, dict[str, Any]]] = {}
 
     async def run_turn(self, request: CreateResponseRequest, ctx: TurnContext) -> None:
@@ -324,6 +329,7 @@ class ExecutorAdapter(HarnessApp):
         input_outcome_logged = False
         self._dispatched_call_ids.clear()
         self._observed_tool_calls.clear()
+        self._observed_tool_item_ids.clear()
         self._pr_tool_calls.clear()
 
         tracing = is_tracing_enabled()
@@ -1304,7 +1310,9 @@ class ExecutorAdapter(HarnessApp):
                 OutputItemDoneEvent(
                     type="response.output_item.done",
                     item={
-                        "id": f"fc_{uuid.uuid4().hex[:12]}",
+                        "id": self._observed_tool_item_ids.setdefault(
+                            call_id, f"fc_{uuid.uuid4().hex[:12]}"
+                        ),
                         "type": "function_call",
                         "status": status,
                         "name": bare_name,
@@ -1314,6 +1322,42 @@ class ExecutorAdapter(HarnessApp):
                     },
                 )
             )
+        elif isinstance(event, ToolCallUpdate):
+            if event.call_id in self._dispatched_call_ids:
+                return
+            if event.call_id not in self._observed_tool_calls:
+                return
+            name = _strip_mcp_tool_prefix(event.name)
+            arguments = _serialize_args(event.args)
+            self._observed_tool_calls[event.call_id] = (name, arguments)
+            self._pr_tool_calls[event.call_id] = (event.name, event.args)
+            ctx.emit(
+                OutputItemDoneEvent(
+                    type="response.output_item.done",
+                    item={
+                        "id": self._observed_tool_item_ids[event.call_id],
+                        "type": "function_call",
+                        "status": _OBSERVED_TOOL_CALL_STATUS,
+                        "name": name,
+                        "arguments": arguments,
+                        "call_id": event.call_id,
+                        "agent": ctx.response_id,
+                    },
+                )
+            )
+        elif isinstance(event, ToolOutputDelta):
+            if (
+                event.call_id in self._observed_tool_calls
+                and event.call_id not in self._dispatched_call_ids
+                and event.delta
+            ):
+                ctx.emit(
+                    ToolOutputDeltaEvent(
+                        type="response.function_call_output.delta",
+                        call_id=event.call_id,
+                        delta=event.delta,
+                    )
+                )
         elif isinstance(event, ToolCallComplete):
             # Suppress dispatched ids (dispatch_tool already emitted their output) and empty ids
             # (unpaiable — they'd render a ghost card). Internally-run tools (e.g. antigravity)
@@ -1321,6 +1365,7 @@ class ExecutorAdapter(HarnessApp):
             call_id = _call_id_from_metadata(getattr(event, "metadata", None)) or ""
             if not call_id:
                 return
+            item_id = self._observed_tool_item_ids.pop(call_id, None)
             if call_id in self._dispatched_call_ids:
                 self._observed_tool_calls.pop(call_id, None)
                 self._pr_tool_calls.pop(call_id, None)
@@ -1354,7 +1399,7 @@ class ExecutorAdapter(HarnessApp):
                     OutputItemDoneEvent(
                         type="response.output_item.done",
                         item={
-                            "id": f"fc_{uuid.uuid4().hex[:12]}",
+                            "id": item_id or f"fc_{uuid.uuid4().hex[:12]}",
                             "type": "function_call",
                             "status": _COMPLETED_TOOL_CALL_STATUS,
                             "name": observed_name,
@@ -1939,90 +1984,6 @@ def _serialize_tool_result(event: ToolCallComplete) -> str:
         event.name,
     )
     return ""
-
-
-_ACP_TOOL_CALL_CONTENT_TYPES = frozenset({"content", "diff", "terminal"})
-
-
-def _stringify_tool_payload(value: Any) -> str:
-    """Coerce a result payload to string (str pass-through, content-block join, JSON fallback).
-
-    Handles Anthropic-style flat text blocks and the ACP ``ToolCallContent`` union
-    (``content`` wrapper, ``diff``, ``terminal``; agentclientprotocol.com/protocol/tool-calls).
-    """
-    if isinstance(value, str):
-        return value
-    if isinstance(value, list):
-        if any(
-            isinstance(block, dict)
-            and isinstance(block.get("type"), str)
-            and block["type"] in _ACP_TOOL_CALL_CONTENT_TYPES
-            for block in value
-        ):
-            # ACP entries are self-contained summaries; keep each on its own line.
-            return "\n".join(_render_acp_tool_call_content(block) for block in value)
-        # Anthropic-style content blocks: join text fields; skip non-text (image, tool_use, etc.).
-        text_parts = [
-            block["text"]
-            for block in value
-            if isinstance(block, dict) and isinstance(block.get("text"), str)
-        ]
-        if text_parts:
-            return "".join(text_parts)
-    return _json_or_repr(value)
-
-
-def _render_acp_tool_call_content(block: Any) -> str:
-    """Render one ACP ``ToolCallContent`` entry.
-
-    Non-text ``content`` blocks are named rather than dumped; unknown shapes keep a JSON fallback.
-    """
-    if isinstance(block, dict):
-        block_type = block.get("type")
-        if block_type == "content":
-            inner = block.get("content")
-            inner_blocks = [
-                b for b in (inner if isinstance(inner, list) else [inner]) if isinstance(b, dict)
-            ]
-            texts = [b["text"] for b in inner_blocks if isinstance(b.get("text"), str)]
-            # Image, audio and resource blocks can carry large base64 payloads; name them instead.
-            kinds = sorted(
-                {
-                    str(b.get("type", "unknown"))
-                    for b in inner_blocks
-                    if not isinstance(b.get("text"), str)
-                }
-            )
-            parts = ["".join(texts)] if texts else []
-            if kinds:
-                parts.append(f"[content: {', '.join(kinds)}]")
-            if parts:
-                return "\n".join(parts)
-        elif block_type == "diff":
-            path = block.get("path")
-            new_text = block.get("newText")
-            line_count = len(new_text.splitlines()) if isinstance(new_text, str) else 0
-            count = f"{line_count} line" + ("" if line_count == 1 else "s")
-            label = f"diff {path} ({count})" if path else f"diff ({count})"
-            return f"{label}\n{new_text}" if isinstance(new_text, str) and new_text else label
-        elif block_type == "terminal":
-            terminal_id = block.get("terminalId")
-            return f"[terminal {terminal_id}]" if terminal_id else "[terminal]"
-        # Preserve the text of flat text blocks mixed into an ACP list.
-        block_text = block.get("text")
-        if isinstance(block_text, str):
-            return block_text
-    return _json_or_repr(block)
-
-
-def _json_or_repr(value: Any) -> str:
-    """JSON-encode ``value``, falling back to ``repr`` for non-serializable payloads."""
-    import json
-
-    try:
-        return json.dumps(value)
-    except (TypeError, ValueError):
-        return repr(value)
 
 
 def _call_id_from_metadata(metadata: dict[str, Any] | None) -> str | None:

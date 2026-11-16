@@ -1590,6 +1590,40 @@ describe("buildBubbles — tool joining", () => {
     expect(t.state).toBe("input-available");
   });
 
+  it("keeps explicit live calls active across interleaved text and settles completed metadata", () => {
+    const active: ActiveResponse = { responseId: "resp_1", state: "streaming", error: null };
+    const tool: AnyBlock = {
+      type: "tool_group",
+      ctx: ctx({ itemId: "fc_live", timestamp: 10 }),
+      executions: [{ ...mkExec("queued", "live"), liveStatus: "in_progress" }],
+      iteration: 0,
+    };
+    const blocks: AnyBlock[] = [
+      tool,
+      { type: "text_done", ctx: ctx(), fullText: "Meanwhile", hasCodeBlocks: false },
+    ];
+    const cache = createBubbleCache();
+    const tools = (input: AnyBlock[]) =>
+      buildBubbles(input, active, cache)
+        .flatMap((bubble) => (bubble.kind === "assistant" ? bubble.items : []))
+        .filter((item) => item.kind === "tool");
+    expect(tools(blocks)[0]).toMatchObject({ state: "input-available" });
+
+    const completed: AnyBlock[] = [
+      {
+        ...tool,
+        executions: [{ ...mkExec("final title", "live"), liveStatus: "completed" }],
+      },
+      blocks[1]!,
+    ];
+    expect(tools(completed)).toHaveLength(1);
+    expect(tools(completed)[0]).toMatchObject({
+      execution: { name: "final title" },
+      state: "no-output",
+      startedAt: 10,
+    });
+  });
+
   it("leaves out journal writes the chat marks, keeping rejected ones and other tools", () => {
     const active: ActiveResponse = { responseId: "resp_1", state: "streaming", error: null };
     const call = (itemId: string, name: string, callId: string): AnyBlock => ({

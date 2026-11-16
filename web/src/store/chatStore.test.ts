@@ -13646,6 +13646,143 @@ describe("chatStore — pumpStreamEvents frame batching", () => {
     controller.abort();
   });
 
+  it.each([false, true])(
+    "updates stable live metadata with snapshot race=%s",
+    async (snapshotRace) => {
+      useChatStore.setState({ conversationId: "conv_live_metadata", blocks: [] });
+      const sink = pushableStream();
+      const controller = new AbortController();
+      const manual = manualScheduler();
+      void pumpStreamEvents(
+        "conv_live_metadata",
+        sink.stream,
+        controller,
+        setState,
+        getState,
+        manual.scheduler,
+      );
+      const call = (callId: string, name: string, status = "in_progress") =>
+        sse("response.output_item.done", {
+          item: {
+            id: `item_${callId}`,
+            type: "function_call",
+            response_id: "resp_live",
+            call_id: callId,
+            name,
+            arguments: JSON.stringify({ command: name }),
+            status,
+          },
+        });
+      const output = (callId: string, text: string) =>
+        sse("response.function_call_output.delta", { call_id: callId, delta: text });
+      const groups = () =>
+        useChatStore
+          .getState()
+          .blocks.filter((block): block is ToolGroup => block.type === "tool_group");
+      const renderedTools = () =>
+        buildBubbles(useChatStore.getState().blocks, useChatStore.getState().activeResponse)
+          .flatMap((bubble) => (bubble.kind === "assistant" ? bubble.items : []))
+          .filter((item) => item.kind === "tool");
+
+      sink.push(sse("response.created", { id: "resp_live", status: "in_progress", output: [] }));
+      sink.push(delta("A"));
+      sink.push(call("first", "queued"));
+      sink.push(call("first", "Bash"));
+      await tick();
+      expect(groups()).toHaveLength(0);
+      expect(manual.pending()).toBe(true);
+      if (snapshotRace) {
+        useChatStore.setState((state) => ({
+          blocks: [
+            ...state.blocks,
+            {
+              type: "tool_group",
+              ctx: { ...state.blocks[0]!.ctx, itemId: "item_first" },
+              executions: [
+                {
+                  name: "snapshot title",
+                  arguments: {},
+                  argsSummary: "",
+                  callId: "first",
+                  agentName: "agent",
+                  executedBy: "server",
+                  output: null,
+                },
+              ],
+              iteration: 0,
+            },
+          ],
+        }));
+      }
+
+      // This delta must commit the buffered card before appending its output.
+      sink.push(output("first", "partial "));
+      await tick();
+      expect(groups()).toHaveLength(1);
+      const original = groups()[0]!;
+      expect(original.executions[0]).toMatchObject({
+        name: "Bash",
+        arguments: { command: "Bash" },
+        argsSummary: "Bash",
+        output: "partial ",
+      });
+
+      sink.push(call("second", "other tool"));
+      sink.push(call("first", "running command"));
+      sink.push(output("first", "output"));
+      sink.push(delta("B"));
+      await tick();
+      manual.fire();
+      expect(groups()).toHaveLength(2);
+      expect(groups()[0]?.ctx).toBe(original.ctx);
+      expect(groups()[0]?.executions[0]).toMatchObject({
+        name: "running command",
+        output: "partial output",
+        liveStatus: "in_progress",
+      });
+      expect(renderedTools()[0]).toMatchObject({
+        execution: { name: "running command" },
+        output: "partial output",
+      });
+
+      sink.push(call("first", "finished command", "completed"));
+      sink.push(call("first", "stale command"));
+      sink.push(output("first", "late delta"));
+      sink.push(
+        sse("response.output_item.done", {
+          item: {
+            id: "out_first",
+            type: "function_call_output",
+            response_id: "resp_live",
+            call_id: "first",
+            output: "authoritative output",
+          },
+        }),
+      );
+      sink.push(output("first", "after result"));
+      sink.push(call("first", "replayed command", "completed"));
+      sink.push(call("second", "second finished", "completed"));
+      await tick();
+      manual.fire();
+
+      expect(groups()).toHaveLength(2);
+      expect(groups()[0]?.executions[0]).toMatchObject({
+        name: "finished command",
+        output: "partial output",
+        liveStatus: "completed",
+      });
+      expect(groups()[1]?.executions[0]?.name).toBe("second finished");
+      expect(renderedTools()).toHaveLength(2);
+      expect(renderedTools()[0]).toMatchObject({
+        execution: { name: "finished command" },
+        output: "authoritative output",
+        state: "output-available",
+      });
+      expect(renderedTools()[1]).toMatchObject({ state: "no-output" });
+      controller.abort();
+    },
+  );
+
   it("appends live command output to the running tool card", async () => {
     useChatStore.setState({ conversationId: "conv_tool_delta", blocks: [] });
     const sink = pushableStream();

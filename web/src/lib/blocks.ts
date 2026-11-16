@@ -196,6 +196,8 @@ export interface ToolExecution {
   agentName: string;
   /** "server" or "client". */
   executedBy: "server" | "client";
+  /** Explicit lifecycle for calls that publish live metadata, not observed MCP calls. */
+  liveStatus?: "in_progress" | "completed";
   /** Tool output text, or `null` if not yet available. */
   output: string | null;
 }

@@ -181,6 +181,23 @@ class ToolCallRequest(ExecutorEvent):
 
 
 @dataclass
+class ToolCallUpdate(ExecutorEvent):
+    """Replace the metadata of an existing observed call without requesting execution."""
+
+    call_id: str
+    name: str
+    args: ToolArgs = field(default_factory=dict)
+
+
+@dataclass
+class ToolOutputDelta(ExecutorEvent):
+    """Append output text to an existing observed call's live preview."""
+
+    call_id: str
+    delta: str
+
+
+@dataclass
 class TurnComplete(ExecutorEvent):
     """The LLM has finished its turn with a final text response.
 

@@ -1859,7 +1859,7 @@ function trailingLiveToolCallIds(
     if (b.type === "native_tool") continue;
     if (b.type !== "tool_group") break;
     for (const ex of b.executions) {
-      callIds.add(ex.callId);
+      if (ex.liveStatus !== "completed") callIds.add(ex.callId);
     }
   }
   return callIds;
@@ -1951,7 +1951,10 @@ function toolItem(
     state = "output-error";
   } else if (lifecycle === "cancelled") {
     state = "cancelled";
-  } else if (isLiveToolCall) {
+  } else if (
+    execution.liveStatus !== "completed" &&
+    (isLiveToolCall || (execution.liveStatus === "in_progress" && lifecycle === "streaming"))
+  ) {
     // The streaming turn is currently parked in a trailing tool phase.
     // Older result-less tools in the same turn should not inherit this
     // spinner once later text/reasoning/tool phases have appeared.

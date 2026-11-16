@@ -49,6 +49,8 @@ from omnigent.inner.executor import (
     ToolCallComplete,
     ToolCallRequest,
     ToolCallStatus,
+    ToolCallUpdate,
+    ToolOutputDelta,
     TurnComplete,
     describe_exception,
 )
@@ -733,7 +735,7 @@ def test_usage_with_active_model_is_none_when_no_usage_reported() -> None:
     assert ex._usage_with_active_model({}) is None
 
 
-def test_in_progress_tool_update_emits_nothing() -> None:
+def test_status_only_tool_update_emits_nothing() -> None:
     ex = AcpExecutor(AcpAgentConfig(command="x"))
     ex._handle_session_update({"sessionUpdate": "tool_call", "toolCallId": "c3", "title": "t"})
     assert (
@@ -742,6 +744,143 @@ def test_in_progress_tool_update_emits_nothing() -> None:
         )
         == []
     )
+
+
+@pytest.mark.parametrize("status", ["pending", "in_progress", None])
+def test_tool_updates_merge_metadata_and_stream_growing_output(status: str | None) -> None:
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._handle_session_update(
+        {"sessionUpdate": "tool_call", "toolCallId": "c1", "title": "Starting"}
+    )
+    text_block = {"type": "text", "text": "first"}
+    update: dict[str, object] = {
+        "sessionUpdate": "tool_call_update",
+        "toolCallId": "c1",
+        "title": "shell",
+        "rawInput": {"command": "ls"},
+        "content": [{"type": "content", "content": text_block}],
+    }
+    if status is not None:
+        update["status"] = status
+    assert ex._handle_session_update(update) == [
+        ToolCallUpdate(call_id="c1", name="shell", args={"command": "ls"}),
+        ToolOutputDelta(call_id="c1", delta="first"),
+    ]
+    assert ex._extract_tool_call({"toolCall": {"toolCallId": "c1"}}) == (
+        "shell",
+        {"command": "ls"},
+    )
+    assert ex._handle_session_update(update) == []
+    text_block["text"] = "first\nsecond"
+    update.pop("title")
+    update["rawInput"] = None
+    assert ex._handle_session_update(update) == [ToolOutputDelta(call_id="c1", delta="\nsecond")]
+    done = ex._handle_session_update(
+        {"sessionUpdate": "tool_call_update", "toolCallId": "c1", "status": "completed"}
+    )
+    assert len(done) == 1
+    assert isinstance(done[0], ToolCallComplete)
+    assert done[0].name == "shell"
+    assert done[0].result == update["content"]
+    assert ex._tool_outputs == ex._tool_streamed_outputs == {}
+    assert (
+        ex._handle_session_update(
+            {"sessionUpdate": "tool_call_update", "toolCallId": "c1", "status": "completed"}
+        )
+        == []
+    )
+
+
+@pytest.mark.parametrize("final_status", ["completed", "failed"])
+def test_tool_output_replacements_are_authoritative_at_completion(final_status: str) -> None:
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    assert (
+        len(
+            ex._handle_session_update(
+                {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "c1",
+                    "title": "shell",
+                    "rawOutput": "old",
+                }
+            )
+        )
+        == 2
+    )
+    assert (
+        ex._handle_session_update(
+            {"sessionUpdate": "tool_call_update", "toolCallId": "c1", "rawOutput": "replacement"}
+        )
+        == []
+    )
+    done = ex._handle_session_update(
+        {"sessionUpdate": "tool_call_update", "toolCallId": "c1", "status": final_status}
+    )
+    assert isinstance(done[0], ToolCallComplete)
+    assert done[0].result == "replacement"
+    assert done[0].status == (
+        ToolCallStatus.SUCCESS if final_status == "completed" else ToolCallStatus.ERROR
+    )
+
+
+def test_empty_content_falls_back_to_retained_raw_output() -> None:
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    started = ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "c1",
+            "title": "shell",
+            "content": [],
+            "rawOutput": "ok",
+        }
+    )
+    assert started[-1] == ToolOutputDelta(call_id="c1", delta="ok")
+    done = ex._handle_session_update(
+        {"sessionUpdate": "tool_call_update", "toolCallId": "c1", "status": "completed"}
+    )
+    assert isinstance(done[0], ToolCallComplete)
+    assert done[0].result == "ok"
+
+
+@pytest.mark.parametrize("output", ["", [], 0, False, {"value": 1}])
+def test_tool_output_preserves_explicit_values(output: object) -> None:
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._handle_session_update(
+        {"sessionUpdate": "tool_call", "toolCallId": "c1", "title": "shell", "rawOutput": "old"}
+    )
+    done = ex._handle_session_update(
+        {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "c1",
+            "status": "completed",
+            "rawOutput": output,
+        }
+    )
+    assert isinstance(done[0], ToolCallComplete)
+    assert done[0].result == ("" if output == [] else output)
+
+
+def test_tool_updates_keep_calls_separate_and_reset_session_output() -> None:
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    for call_id in ("c1", "c2"):
+        ex._handle_session_update(
+            {"sessionUpdate": "tool_call", "toolCallId": call_id, "title": "shell"}
+        )
+    for call_id, text in (("c1", "first"), ("c2", "second"), ("c1", "first more")):
+        events = ex._handle_session_update(
+            {"sessionUpdate": "tool_call_update", "toolCallId": call_id, "rawOutput": text}
+        )
+        assert events == [
+            ToolOutputDelta(call_id=call_id, delta=" more" if text == "first more" else text)
+        ]
+    assert (
+        ex._handle_session_update(
+            {"sessionUpdate": "tool_call_update", "toolCallId": "unknown", "rawOutput": "ignored"}
+        )
+        == []
+    )
+    ex._reset_session_state()
+    assert ex._tool_names == ex._tool_inputs == ex._tool_outputs == ex._tool_streamed_outputs == {}
 
 
 # ---------------------------------------------------------------------------

@@ -140,6 +140,7 @@ interface ReducerState {
   // delayed function_call_output can still render with the original
   // tool name/arguments instead of being dropped.
   toolExecutionsByCallId: Map<string, ToolExecution>;
+  toolItemIdsByCallId: Map<string, string>;
   // Dedup set: every `callId` we've yielded a ToolGroup for in the
   // CURRENT response. Survives `pendingTools` clears (which fire on
   // each TextDelta to flush ToolResultBlock for completed tools), so
@@ -189,6 +190,7 @@ function createState(flushThreshold: number): ReducerState {
     fullText: "",
     pendingTools: new Map(),
     toolExecutionsByCallId: new Map(),
+    toolItemIdsByCallId: new Map(),
     seenCallIds: new Set(),
     seenResultCallIds: new Set(),
     agent: null,
@@ -338,6 +340,7 @@ function* beginResponse(state: ReducerState, response: Response): Generator<AnyB
   }
   state.pendingTools.clear();
   state.toolExecutionsByCallId.clear();
+  state.toolItemIdsByCallId.clear();
   state.agent = response.model;
   // Reset per-response dedup at the task boundary — cross-task call_id
   // reuse must render independently (see migration plan §4.4).
@@ -528,8 +531,8 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
       // and drops the second so the renderer doesn't draw the call
       // line twice. See designs/RUN_OMNIGENT_REPL_PARITY.md.
       //
-      // Non-MCP paths emit exactly one ToolCall per callId, so the
-      // second-arrival branch never fires for them.
+      // A stable item id on a live call identifies full metadata updates,
+      // unlike MCP observed/dispatch twins (separate or absent item ids).
       if (state.seenCallIds.has(event.callId)) {
         // Already rendered the call line for this callId. Re-register
         // in pendingTools so the eventual `ToolResult` can pair by
@@ -546,8 +549,36 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
           executedBy: "server",
           output: null,
         };
+        const sameItem =
+          Boolean(event.itemId) && state.toolItemIdsByCallId.get(event.callId) === event.itemId;
+        const hasResult = state.seenResultCallIds.has(
+          `${event.responseId || state.responseId}:${event.callId}`,
+        );
+        if (
+          sameItem &&
+          execution.liveStatus === "in_progress" &&
+          (event.status === "completed" || (event.status === "in_progress" && !hasResult))
+        ) {
+          const updated: ToolExecution = {
+            ...execution,
+            name: event.name,
+            arguments: event.arguments,
+            argsSummary: formatToolArgsBrief(event.name, event.arguments),
+            agentName: event.agentName,
+            liveStatus: event.status,
+          };
+          state.toolExecutionsByCallId.set(event.callId, updated);
+          if (!hasResult) state.pendingTools.set(event.callId, updated);
+          yield {
+            type: "tool_group",
+            ctx: ctx(state, event.itemId, event.responseId || null),
+            executions: [updated],
+            iteration: 0,
+          } satisfies ToolGroup;
+          return;
+        }
         state.toolExecutionsByCallId.set(event.callId, execution);
-        state.pendingTools.set(event.callId, execution);
+        if (!hasResult) state.pendingTools.set(event.callId, execution);
         return;
       }
       state.seenCallIds.add(event.callId);
@@ -564,8 +595,10 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
         executedBy: "server",
         output: null,
       };
+      if (event.status === "in_progress") execution.liveStatus = "in_progress";
       state.pendingTools.set(event.callId, execution);
       state.toolExecutionsByCallId.set(event.callId, execution);
+      state.toolItemIdsByCallId.set(event.callId, event.itemId);
       // Yield immediately so the user sees the tool call before
       // execution. output=null means the renderer shows the call
       // line but no result panel.
@@ -737,6 +770,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
         state.responseId = event.responseId;
         state.pendingTools.clear();
         state.toolExecutionsByCallId.clear();
+        state.toolItemIdsByCallId.clear();
         state.seenCallIds.clear();
         state.seenResultCallIds.clear();
         state.reasoningStreamed = false;
@@ -788,6 +822,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
         state.responseId = event.responseId;
         state.pendingTools.clear();
         state.toolExecutionsByCallId.clear();
+        state.toolItemIdsByCallId.clear();
         state.seenCallIds.clear();
         state.seenResultCallIds.clear();
       }

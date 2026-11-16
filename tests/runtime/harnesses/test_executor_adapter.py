@@ -1784,6 +1784,70 @@ def test_observed_tool_call_reemits_a_completed_function_call() -> None:
     assert completed["arguments"] == '{"command": "ls"}', "args carried from the request"
 
 
+def test_acp_live_updates_preserve_identity_metadata_and_final_output() -> None:
+    from omnigent.inner.acp_executor import AcpAgentConfig, AcpExecutor
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.server.schemas import ToolOutputDeltaEvent
+
+    executor = AcpExecutor(AcpAgentConfig(command="x"))
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+    ctx = _RecordingTurnContext()
+    for update in (
+        {"sessionUpdate": "tool_call", "toolCallId": "c1", "title": "Starting"},
+        {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "c1",
+            "status": "in_progress",
+            "title": "shell",
+            "rawInput": {"command": "ls"},
+            "rawOutput": "first",
+        },
+        {"sessionUpdate": "tool_call_update", "toolCallId": "c1", "rawOutput": "first second"},
+        {"sessionUpdate": "tool_call_update", "toolCallId": "c1", "status": "completed"},
+    ):
+        for event in executor._handle_session_update(update):
+            adapter._translate_event(event, ctx)  # type: ignore[arg-type]
+
+    items = _fc_items(ctx)
+    calls = [item for item in items if item["type"] == "function_call"]
+    assert len(calls) == 3
+    assert len({item["id"] for item in calls}) == 1
+    assert calls[-1]["status"] == "completed"
+    assert calls[-1]["name"] == "shell"
+    assert calls[-1]["arguments"] == '{"command": "ls"}'
+    assert items[-1]["output"] == "first second"
+    assert [event.delta for event in ctx.emitted if isinstance(event, ToolOutputDeltaEvent)] == [
+        "first",
+        " second",
+    ]
+    assert not adapter._pending_mcp_call_ids
+    assert not adapter._observed_tool_item_ids
+
+
+@pytest.mark.parametrize("call_id", ["dispatched", "unknown", ""])
+def test_live_tool_events_do_not_duplicate_dispatched_or_unknown_calls(call_id: str) -> None:
+    from omnigent.inner.executor import ToolCallRequest, ToolCallUpdate, ToolOutputDelta
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _RecordingTurnContext()
+    adapter._translate_event(
+        ToolCallRequest(name="shell", metadata={"call_id": "dispatched"}),
+        ctx,  # type: ignore[arg-type]
+    )
+    adapter._dispatched_call_ids.add("dispatched")
+    ctx.emitted.clear()
+    adapter._translate_event(
+        ToolCallUpdate(call_id=call_id, name="Updated"),
+        ctx,  # type: ignore[arg-type]
+    )
+    adapter._translate_event(
+        ToolOutputDelta(call_id=call_id, delta="ignored"),
+        ctx,  # type: ignore[arg-type]
+    )
+    assert ctx.emitted == []
+
+
 def test_uncached_completion_reemits_no_function_call() -> None:
     """A completion with no cached in_progress request re-emits no card.
 

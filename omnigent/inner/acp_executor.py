@@ -63,6 +63,7 @@ from omnigent.debug_logging import debug_event
 from omnigent.inner import _proc
 from omnigent.inner._acp_metadata import _META_INPUT_ITEM_ID
 from omnigent.inner._acp_omnigent_mcp import OmnigentAcpMcp, _mcp_enabled
+from omnigent.inner._tool_output import stringify_tool_payload
 from omnigent.inner.acp_extension import NO_ACP_EXTENSION, AcpExtension
 from omnigent.inner.acp_subagents import SubAgentActivity, SubAgentStart, read_subagent_events
 from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
@@ -82,6 +83,8 @@ from omnigent.inner.executor import (
     ToolCallComplete,
     ToolCallRequest,
     ToolCallStatus,
+    ToolCallUpdate,
+    ToolOutputDelta,
     ToolSpec,
     TurnComplete,
     describe_exception,
@@ -620,6 +623,8 @@ class AcpExecutor(Executor):
         # request that names only the id can still say what is about to run.
         self._tool_names: dict[str, str] = {}
         self._tool_inputs: dict[str, _AcpJsonObject] = {}
+        self._tool_outputs: dict[str, _AcpJsonObject] = {}
+        self._tool_streamed_outputs: dict[str, str] = {}
 
         # Context-window size (tokens) reported via ``usage_update``; surfaced by
         # :meth:`max_context_tokens` so the UI context meter fills.
@@ -1698,6 +1703,8 @@ class AcpExecutor(Executor):
         self._system_prompt_sent = False
         self._tool_names.clear()
         self._tool_inputs.clear()
+        self._tool_outputs.clear()
+        self._tool_streamed_outputs.clear()
         self._bridge_tool_aliases = frozenset()
 
     def _handle_session_update(self, update: _AcpJsonObject) -> list[ExecutorEvent]:
@@ -1755,7 +1762,7 @@ class AcpExecutor(Executor):
             name = update.get("title") or update.get("kind") or "tool"
             raw_input = update.get("rawInput")
             args = raw_input if isinstance(raw_input, dict) else {}
-            if isinstance(call_id, str) and call_id:
+            if isinstance(call_id, str) and call_id and call_id not in self._tool_names:
                 self._tool_names[call_id] = str(name)
                 self._tool_inputs[call_id] = args
                 metadata: _AcpJsonObject = {"call_id": call_id}
@@ -1765,27 +1772,11 @@ class AcpExecutor(Executor):
                 if not self._is_bridge_tool_call(str(name), update):
                     metadata["internally_executed"] = True
                 events.append(ToolCallRequest(name=str(name), args=args, metadata=metadata))
+                self._update_tool_call(call_id, update, events)
         elif update_type == _UPDATE_TOOL_CALL_UPDATE:
             call_id = update.get("toolCallId")
-            status = update.get("status")
-            if isinstance(call_id, str) and status in (
-                _TOOL_STATUS_COMPLETED,
-                _TOOL_STATUS_FAILED,
-            ):
-                name = self._tool_names.pop(call_id, "tool")
-                self._tool_inputs.pop(call_id, None)
-                events.append(
-                    ToolCallComplete(
-                        name=name,
-                        status=(
-                            ToolCallStatus.SUCCESS
-                            if status == _TOOL_STATUS_COMPLETED
-                            else ToolCallStatus.ERROR
-                        ),
-                        result=update.get("content") or update.get("rawOutput"),
-                        metadata={"call_id": call_id},
-                    )
-                )
+            if isinstance(call_id, str) and call_id in self._tool_names:
+                self._update_tool_call(call_id, update, events)
         elif update_type == _UPDATE_USAGE:
             size = update.get("size")
             if isinstance(size, int) and size > 0:
@@ -1795,6 +1786,61 @@ class AcpExecutor(Executor):
             self._note_config_options(update.get("configOptions"))
 
         return events
+
+    def _update_tool_call(
+        self, call_id: str, update: _AcpJsonObject, events: list[ExecutorEvent]
+    ) -> None:
+        """Merge partial ACP state and emit only growing output before final completion."""
+        name = update.get("title")
+        args = update.get("rawInput")
+        changed = False
+        if isinstance(name, str) and name and name != self._tool_names[call_id]:
+            self._tool_names[call_id] = name
+            changed = True
+        if isinstance(args, dict) and args != self._tool_inputs[call_id]:
+            self._tool_inputs[call_id] = args
+            changed = True
+        if changed:
+            events.append(
+                ToolCallUpdate(
+                    call_id=call_id,
+                    name=self._tool_names[call_id],
+                    args=self._tool_inputs[call_id],
+                )
+            )
+
+        output_state = self._tool_outputs.setdefault(call_id, {})
+        for key in ("content", "rawOutput"):
+            value = update.get(key)
+            if value is not None:
+                output_state[key] = value
+        result = output_state.get("content") or output_state.get("rawOutput", "")
+        status = update.get("status")
+        if status in (_TOOL_STATUS_COMPLETED, _TOOL_STATUS_FAILED):
+            name = self._tool_names.pop(call_id)
+            self._tool_inputs.pop(call_id, None)
+            self._tool_outputs.pop(call_id, None)
+            self._tool_streamed_outputs.pop(call_id, None)
+            events.append(
+                ToolCallComplete(
+                    name=name,
+                    status=(
+                        ToolCallStatus.SUCCESS
+                        if status == _TOOL_STATUS_COMPLETED
+                        else ToolCallStatus.ERROR
+                    ),
+                    result="" if result == [] else result,
+                    metadata={"call_id": call_id},
+                )
+            )
+            return
+
+        rendered = "" if result == [] else stringify_tool_payload(result)
+        previous = self._tool_streamed_outputs.get(call_id, "")
+        # The wire event appends text; replacements wait for the authoritative final item.
+        if rendered.startswith(previous) and len(rendered) > len(previous):
+            self._tool_streamed_outputs[call_id] = rendered
+            events.append(ToolOutputDelta(call_id=call_id, delta=rendered[len(previous) :]))
 
     def _note_config_options(self, options: object) -> str | None:
         """Record session config options and return any echoed model ``currentValue``."""

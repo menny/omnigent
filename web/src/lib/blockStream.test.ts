@@ -967,6 +967,66 @@ describe("BlockStream — tool calls", () => {
     expect(groups[0]!.executions[0]!.callId).toBe("tool_use_xyz");
   });
 
+  it("emits stable live metadata replacements without reopening completed calls", () => {
+    const call = (name: string, status: string, itemId = "item_live"): StreamEvent => ({
+      type: "tool_call",
+      name,
+      arguments: { command: name },
+      status,
+      callId: "call_live",
+      agentName: "agent",
+      itemId,
+      responseId: "resp_1",
+    });
+    const groups = reduce([
+      call("queued", "in_progress"),
+      call("MCP twin", "action_required", "item_dispatch"),
+      { type: "text_delta", delta: "Interleaved text\n" },
+      call("Bash", "in_progress"),
+      call("finished", "completed"),
+      call("stale", "in_progress"),
+      call("replayed", "completed"),
+    ]).filter((block): block is ToolGroup => block.type === "tool_group");
+
+    expect(groups.map((group) => group.executions[0]?.name)).toEqual([
+      "queued",
+      "Bash",
+      "finished",
+    ]);
+    expect(groups.map((group) => group.ctx.itemId)).toEqual([
+      "item_live",
+      "item_live",
+      "item_live",
+    ]);
+    expect(groups[0]?.executions[0]?.name).toBe("queued");
+    expect(groups[1]?.executions[0]?.argsSummary).toBe("Bash");
+    expect(groups[2]?.executions[0]?.liveStatus).toBe("completed");
+  });
+
+  it("does not requeue a completed result when late metadata arrives", () => {
+    const call: StreamEvent = {
+      type: "tool_call",
+      name: "shell",
+      arguments: {},
+      callId: "live",
+      status: "in_progress",
+      agentName: "agent",
+      itemId: "item_live",
+      responseId: "resp_1",
+    };
+    const blocks = reduce([
+      call,
+      { type: "tool_result", callId: "live", output: "final", itemId: "out", responseId: "resp_1" },
+      { ...call, name: "stale" },
+      { ...call, name: "final title", status: "completed" },
+      { type: "text_delta", delta: "After\n" },
+      { type: "response_completed", response: makeResponse() },
+    ]);
+    expect(blocks.filter((block) => block.type === "tool_result")).toHaveLength(1);
+    const groups = blocks.filter((block): block is ToolGroup => block.type === "tool_group");
+    expect(groups.map((group) => group.executions[0]?.name)).toEqual(["shell", "final title"]);
+  });
+
   it("two ToolCalls with distinct callIds yield TWO ToolGroups", () => {
     // The dedup is keyed on callId, not on (name, args). An LLM can
     // legitimately invoke the same tool twice with the same arguments

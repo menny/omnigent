@@ -7299,6 +7299,26 @@ function applyLiveDelta(set: Setter, messageId: string, delta: string, index?: n
   });
 }
 
+/** Replace live metadata without discarding streamed output or reopening completed calls. */
+function mergeLiveToolGroup(existing: ToolGroup, incoming: ToolGroup): ToolGroup {
+  if (
+    existing.ctx.itemId !== incoming.ctx.itemId ||
+    existing.ctx.responseId !== incoming.ctx.responseId
+  )
+    return existing;
+  return {
+    ...existing,
+    executions: existing.executions.map((execution) => {
+      const updated = incoming.executions.find(
+        (candidate) => candidate.callId === execution.callId,
+      );
+      if (!updated || updated.liveStatus === undefined) return execution;
+      if (execution.liveStatus === "completed") return execution;
+      return { ...updated, output: execution.output, executedBy: execution.executedBy };
+    }),
+  };
+}
+
 /** Append live output to the matching in-progress tool execution. */
 function applyLiveToolOutputDelta(set: Setter, callId: string, delta: string): void {
   set((s) => {
@@ -7308,6 +7328,19 @@ function applyLiveToolOutputDelta(set: Setter, callId: string, delta: string): v
     );
     if (at === -1) return {};
     const group = s.blocks[at] as ToolGroup;
+    if (
+      group.executions.some(
+        (execution) => execution.callId === callId && execution.liveStatus === "completed",
+      ) ||
+      s.blocks.some(
+        (block) =>
+          block.type === "tool_result" &&
+          block.ctx.responseId === group.ctx.responseId &&
+          block.callId === callId,
+      )
+    ) {
+      return {};
+    }
     const executions = group.executions.map((execution) =>
       execution.callId === callId
         ? { ...execution, output: (execution.output ?? "") + delta }
@@ -7366,6 +7399,7 @@ async function* tapLiveDeltas(
   ignored: Set<string>,
   set: Setter,
   get: Getter,
+  flush: () => void,
 ): AsyncIterable<StreamEvent> {
   for await (const ev of events) {
     if (ev.type === "message_done" && ev.messageId !== undefined) {
@@ -7386,6 +7420,8 @@ async function* tapLiveDeltas(
     }
     if (ev.type === "tool_output_delta") {
       if (!isConversationDisposed(id) && !isStaleCompletedResponse(get())) {
+        // The matching card (or authoritative result) may still await a frame.
+        flush();
         reviveStrayCompletedResponse(set);
         applyLiveToolOutputDelta(set, ev.callId, ev.delta);
       }
@@ -7697,6 +7733,7 @@ export async function pumpStreamEvents(
     ignoredMessages,
     set,
     get,
+    () => flush(),
   );
   // First content block of each response flushes synchronously (snappy
   // first-token paint); the rest batch.
@@ -7722,11 +7759,20 @@ export async function pumpStreamEvents(
       // and appending the buffered copy would double-render it. ItemId-less
       // blocks skip the check, so pure token batches stay cheap.
       let fresh = batch;
+      let blocks = s.blocks;
       if (batch.some((b) => b.ctx.itemId)) {
         const committed = new Set(
           s.blocks.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
         );
-        fresh = batch.filter((b) => !b.ctx.itemId || !committed.has(b.ctx.itemId));
+        fresh = batch.filter((b) => {
+          if (!b.ctx.itemId || !committed.has(b.ctx.itemId)) return true;
+          if (b.type === "tool_group" && b.executions.some((ex) => ex.liveStatus !== undefined)) {
+            blocks = blocks.map((existing) =>
+              existing.type === "tool_group" ? mergeLiveToolGroup(existing, b) : existing,
+            );
+          }
+          return false;
+        });
       }
       // Same commit-time recheck for elicitations, keyed by
       // elicitationId: the reconnect reconcile can append the
@@ -7742,7 +7788,9 @@ export async function pumpStreamEvents(
           (b) => b.type !== "elicitation" || !committedElicitations.has(b.elicitationId),
         );
       }
-      if (fresh.length === 0) return extra ?? {};
+      if (fresh.length === 0) {
+        return { ...(extra ?? {}), ...(blocks !== s.blocks ? { blocks } : {}) };
+      }
       // Only newly accepted text counts, not snapshot hydration or duplicates.
       const hasAssistantText = fresh.some((b) =>
         b.type === "text_chunk"
@@ -7757,7 +7805,7 @@ export async function pumpStreamEvents(
               mcpStartupLaunch: { ...s.mcpStartupLaunch, dismissed: true },
             }
           : {}),
-        blocks: [...s.blocks, ...fresh],
+        blocks: [...blocks, ...fresh],
       };
     });
   };
@@ -7830,6 +7878,29 @@ export async function pumpStreamEvents(
             next.splice(at, 1);
             return { blocks: next };
           });
+        }
+      }
+
+      // Stable live tool items carry full replacement metadata. Update the
+      // existing card before item-id dedup, retaining its output and start time.
+      if (block.type === "tool_group" && block.ctx.itemId) {
+        const matches = (candidate: AnyBlock): candidate is ToolGroup =>
+          candidate.type === "tool_group" &&
+          candidate.ctx.itemId === block.ctx.itemId &&
+          candidate.ctx.responseId === block.ctx.responseId;
+        const merge = (existing: ToolGroup): ToolGroup => mergeLiveToolGroup(existing, block);
+        const buffered = buffer.findIndex(matches);
+        if (buffered !== -1) {
+          buffer[buffered] = merge(buffer[buffered] as ToolGroup);
+          continue;
+        }
+        if (get().blocks.some(matches)) {
+          set((s) => ({
+            blocks: s.blocks.map((candidate) =>
+              matches(candidate) ? merge(candidate) : candidate,
+            ),
+          }));
+          continue;
         }
       }
 
